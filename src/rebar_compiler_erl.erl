@@ -12,6 +12,11 @@
 -include("rebar.hrl").
 -include_lib("providers/include/providers.hrl").
 
+-record(filecache, {
+    dirs = [],
+    filemap = maps:new()
+}).
+
 context(AppInfo) ->
     EbinDir = rebar_app_info:ebin_dir(AppInfo),
     Mappings = [{".beam", EbinDir}],
@@ -273,7 +278,10 @@ process_attr(import, Form, Includes, _Dir) ->
     end;
 process_attr(file, Form, Includes, _Dir) ->
     {File, _} = erl_syntax_lib:analyze_file_attribute(Form),
-    [File|Includes];
+    case lists:member(File, Includes) of
+        true -> Includes;
+        false -> [File|Includes]
+    end;
 process_attr(include, Form, Includes, _Dir) ->
     [FileNode] = erl_syntax:attribute_arguments(Form),
     File = erl_syntax:string_value(FileNode),
@@ -320,18 +328,30 @@ process_attr(_, _Form, Includes, _Dir) ->
 -spec expand_file_names([file:filename()],
                         [file:filename()]) -> [file:filename()].
 expand_file_names(Files, Dirs) ->
+
+    %% Retreive the cache of base filenames -> absolute paths
+    %% from the process dictionary
+    Cache = case erlang:get(expand_file_names_cache) of
+        undefined -> #filecache{};
+        C -> C
+    end,
+
     %% We check if Files exist by itself or within the directories
     %% listed in Dirs.
     %% Return the list of files matched.
-    lists:flatmap(
-      fun(Incl) ->
-              case filelib:is_regular(Incl) of
-                  true ->
-                      [Incl];
-                  false ->
-                      rebar_utils:find_files_in_dirs(Dirs, [$^, Incl, $$], true)
-              end
-      end, Files).
+    {R, NewCache} = lists:mapfoldl(
+        fun(Incl, C) ->
+            case filelib:is_regular(Incl) of
+                true ->
+                    {[Incl], C};
+                false ->
+                    find_files_in_dirs(Dirs, Incl, C)
+            end
+        end, Cache, Files),
+
+    %% Stash the cache of filenames in the process dictionary
+    erlang:put(expand_file_names_cache, NewCache),
+    lists:append(R).
 
 %% Given a path like "stdlib/include/erl_compile.hrl", return
 %% "OTP_INSTALL_DIR/lib/erlang/lib/stdlib-x.y.z/include/erl_compile.hrl".
@@ -374,3 +394,47 @@ format_error({cannot_read_file, Source, Reason}) ->
     lists:flatten(io_lib:format("Cannot read file '~s': ~s", [Source, Reason]));
 format_error(Other) ->
     io_lib:format("~p", [Other]).
+
+
+%% Update the cache of base filenames -> absolute filenames and then
+%% search for the filename.
+
+find_files_in_dirs(Dirs, File, FileCache) ->
+    NewFileCache = cache_dir_trees(Dirs, FileCache),
+    R = maps:get(filename:basename(File), NewFileCache#filecache.filemap, []),
+    {R, NewFileCache}.
+
+
+%% Construct a mapping of base filenames to the absolute paths to
+%% those files. Add any missing directory trees.
+cache_dir_trees([], FileCache) ->
+    FileCache;
+cache_dir_trees([Dir|Dirs], FileCache) ->
+    #filecache{dirs = CachedDirs, filemap = FileMap} = FileCache,
+    case lists:member(Dir, CachedDirs) of
+        true ->
+            cache_dir_trees(Dirs, FileCache);
+        false ->
+            cache_dir_trees(Dirs,
+                #filecache{dirs = [Dir|CachedDirs],
+                           filemap = dir_tree(Dir, FileMap)})
+    end.
+
+%% Recursively traverse directories and return a map of base filenames
+%% to the absolute path to those files.
+dir_tree(Dir, FileMap) ->
+    case file:list_dir(Dir) of
+        {ok, Entries} ->
+            lists:foldl(
+                fun(Entry, Map) ->
+                    case filelib:is_dir(Entry) of
+                        true ->
+                            SubDir = filename:join(Dir, Entry),
+                            dir_tree(SubDir, Map);
+                        false -> 
+                            maps:put(Entry, [filename:join(Dir, Entry)], Map)
+                    end
+                end, FileMap, Entries);
+        {error, _Reason} ->
+            FileMap
+    end.
