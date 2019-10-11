@@ -14,7 +14,8 @@
 
 -record(filecache, {
     dirs = [],
-    filemap = maps:new()
+    filemap = maps:new(),
+    is_regular = maps:new()
 }).
 
 context(AppInfo) ->
@@ -341,11 +342,24 @@ expand_file_names(Files, Dirs) ->
     %% Return the list of files matched.
     {R, NewCache} = lists:mapfoldl(
         fun(Incl, C) ->
-            case filelib:is_regular(Incl) of
+
+            IsRegularMap = C#filecache.is_regular,
+            {IsRegular, NewC} =
+                case maps:get(Incl, IsRegularMap, undefined) of
+                    undefined ->
+                        IsR = filelib:is_regular(Incl),
+                        NewIsRMap =  maps:put(Incl, IsR, IsRegularMap),
+                        {IsR, C#filecache{is_regular = NewIsRMap}};
+
+                    IsR ->
+                        {IsR, C}
+                end,
+
+            case IsRegular of
                 true ->
-                    {[Incl], C};
+                    {[Incl], NewC};
                 false ->
-                    find_files_in_dirs(Dirs, Incl, C)
+                    find_files_in_dirs(Dirs, Incl, NewC)
             end
         end, Cache, Files),
 
